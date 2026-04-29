@@ -5,7 +5,7 @@ const FINNHUB_KEY = process.env.FINNHUB_KEY;
 
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
-  databaseURL: "  databaseURL: "https://watchlist-d9ade-default-rtdb.firebaseio.com""
+  databaseURL: "https://watchlist-d9ade-default-rtdb.firebaseio.com"
 });
 
 const db = admin.database();
