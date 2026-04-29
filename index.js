@@ -2,7 +2,7 @@ import admin from 'firebase-admin';
 import WebSocket from 'ws';
 import http from 'http';
 
-const FINNHUB_KEY = process.env.FINNHUB_KEY;
+const FINNHUB_KEY = "d7ok9vhr01qsb7bf9bdgd7ok9vhr01qsb7bf9be0";
 
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
