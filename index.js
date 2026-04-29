@@ -2,10 +2,9 @@ import admin from 'firebase-admin';
 import WebSocket from 'ws';
 
 const FINNHUB_KEY = process.env.FINNHUB_KEY;
-const firebaseConfig = { /* Paste your Firebase Admin config here later */ };
 
 admin.initializeApp({
-  credential: admin.credential.cert(firebaseConfig),
+  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
   databaseURL: "https://watchlist-d9ade.firebaseio.com"
 });
 
@@ -16,33 +15,35 @@ const pricesRef = db.ref('prices');
 let ws = null;
 let subscribed = new Set();
 
-function connect() {
+function connectWebSocket() {
   ws = new WebSocket(`wss://ws.finnhub.io?token=${FINNHUB_KEY}`);
 
   ws.on('open', () => {
-    console.log('✅ Connected to Finnhub');
-    subscribeToWatchlist();
+    console.log('✅ Connected to Finnhub WebSocket');
+    subscribeToCurrentWatchlist();
   });
 
   ws.on('message', (data) => {
     const msg = JSON.parse(data);
-    if (msg.type === 'trade') {
+    if (msg.type === 'trade' && msg.data) {
       msg.data.forEach(t => {
         pricesRef.child(t.s).set({
           price: t.p,
-          timestamp: t.t
+          timestamp: Date.now()
         });
       });
     }
   });
 
-  ws.on('close', () => setTimeout(connect, 3000));
+  ws.on('close', () => {
+    console.log('Connection closed. Reconnecting...');
+    setTimeout(connectWebSocket, 5000);
+  });
 }
 
-async function subscribeToWatchlist() {
-  const snap = await watchlistRef.once('value');
-  const list = snap.val() || {};
-
+async function subscribeToCurrentWatchlist() {
+  const snapshot = await watchlistRef.once('value');
+  const list = snapshot.val() || {};
   Object.keys(list).forEach(symbol => {
     if (!subscribed.has(symbol)) {
       ws.send(JSON.stringify({ type: 'subscribe', symbol: symbol }));
@@ -51,14 +52,13 @@ async function subscribeToWatchlist() {
   });
 }
 
-// Auto subscribe when someone adds a stock
 watchlistRef.on('child_added', (snap) => {
   const symbol = snap.key;
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === WebSocket.OPEN && !subscribed.has(symbol)) {
     ws.send(JSON.stringify({ type: 'subscribe', symbol }));
     subscribed.add(symbol);
   }
 });
 
-connect();
-console.log('🚀 WorldVest Price Updater Running...');
+connectWebSocket();
+console.log('🚀 WorldVest Updater started on Render');
