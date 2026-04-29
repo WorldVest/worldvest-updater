@@ -1,5 +1,6 @@
 import admin from 'firebase-admin';
 import WebSocket from 'ws';
+import http from 'http';
 
 const FINNHUB_KEY = process.env.FINNHUB_KEY;
 
@@ -16,6 +17,16 @@ let ws = null;
 let subscribed = new Set();
 let heartbeatInterval = null;
 
+// HTTP server for Render
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('WorldVest Price Updater is running...');
+});
+
+server.listen(process.env.PORT || 3000, () => {
+  console.log(`HTTP server listening on port ${process.env.PORT || 3000}`);
+});
+
 function connectWebSocket() {
   if (ws) ws.close();
 
@@ -25,13 +36,12 @@ function connectWebSocket() {
     console.log('✅ Connected to Finnhub WebSocket');
     subscribeToCurrentWatchlist();
     
-    // Heartbeat to keep connection alive
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'ping' }));  // Helps prevent timeout
+        ws.send(JSON.stringify({ type: 'ping' }));
       }
-    }, 25000); // every 25 seconds
+    }, 25000);
   });
 
   ws.on('message', (data) => {
@@ -46,31 +56,24 @@ function connectWebSocket() {
     }
   });
 
-  ws.on('close', (code) => {
-    console.log(`Connection closed (code: ${code}). Reconnecting in 5s...`);
+  ws.on('close', () => {
+    console.log('Connection closed. Reconnecting...');
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     setTimeout(connectWebSocket, 5000);
-  });
-
-  ws.on('error', (err) => {
-    console.error('WebSocket error:', err.message);
   });
 }
 
 async function subscribeToCurrentWatchlist() {
   const snapshot = await watchlistRef.once('value');
   const list = snapshot.val() || {};
-
   Object.keys(list).forEach(symbol => {
     if (!subscribed.has(symbol)) {
-      ws.send(JSON.stringify({ type: 'subscribe', symbol: symbol }));
+      ws.send(JSON.stringify({ type: 'subscribe', symbol }));
       subscribed.add(symbol);
-      console.log(`Subscribed to ${symbol}`);
     }
   });
 }
 
-// Auto-subscribe when new stock is added
 watchlistRef.on('child_added', (snap) => {
   const symbol = snap.key;
   if (ws && ws.readyState === WebSocket.OPEN && !subscribed.has(symbol)) {
@@ -80,5 +83,4 @@ watchlistRef.on('child_added', (snap) => {
 });
 
 connectWebSocket();
-
 console.log('🚀 WorldVest Updater Running...');
