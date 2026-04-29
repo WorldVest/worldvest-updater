@@ -18,6 +18,10 @@ let ws = null;
 let subscribed = new Set();
 let heartbeatInterval = null;
 
+// In-memory caches so we don't pound Firebase on every WS tick
+const cryptoPrevClose = {};   // {symbol: {price, date}}
+const lastPercentWrite = {};  // {symbol: timestamp} — throttle percent writes
+
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('WorldVest Price Updater is running...');
@@ -27,8 +31,9 @@ server.listen(process.env.PORT || 3000, () => {
 });
 
 function isCrypto(symbol) { return symbol.includes(':'); }
+function todayUTC() { return new Date().toISOString().slice(0,10); }
 
-// ---------- Finnhub /quote (stocks only — gives us percent change) ----------
+// ---------- Finnhub /quote (stocks only) ----------
 async function fetchQuote(symbol) {
   if (isCrypto(symbol)) return null;
   try {
@@ -54,15 +59,13 @@ async function refreshAllQuotes() {
   const list = snap.val() || {};
   const symbols = Object.keys(list);
   if (symbols.length === 0) return;
-  console.log(`[quote] refreshing ${symbols.length} symbols`);
+  console.log(`[quote] refreshing ${symbols.filter(s => !isCrypto(s)).length} stock symbols`);
   for (const symbol of symbols) {
     if (isCrypto(symbol)) continue;
     const q = await fetchQuote(symbol);
     if (!q) continue;
-    const existing = (await pricesRef.child(symbol).once('value')).val() || {};
-    const price = existing.price && existing.price > 0 ? existing.price : q.price;
     await pricesRef.child(symbol).update({
-      price,
+      price: q.price,
       percent: q.percent,
       prevClose: q.prevClose,
       updatedAt: Date.now(),
@@ -71,31 +74,29 @@ async function refreshAllQuotes() {
   }
 }
 
-// For crypto: compute % change from yesterday's close at midnight UTC.
-// We snapshot the price near midnight and store as `prevClose`. Then % is
-// just (price - prevClose) / prevClose.
-async function ensureCryptoPrevClose(symbol, currentPrice) {
+// ---------- Crypto prevClose seeding (once per UTC day, in memory) ----------
+async function seedCryptoPrevClose(symbol, currentPrice) {
   if (!currentPrice || currentPrice <= 0) return;
-  const existing = (await pricesRef.child(symbol).once('value')).val() || {};
-  const today = new Date().toISOString().slice(0,10);
-  if (existing.prevCloseDate === today && existing.prevClose) return; // already set
-  // First time we see this crypto today — anchor today's prevClose to current
-  // price. Real prev close is tricky without a paid feed; this gives an
-  // intra-day delta that's close enough for a watchlist.
+  const today = todayUTC();
+  const cached = cryptoPrevClose[symbol];
+  if (cached && cached.date === today) return; // already seeded today
+
+  // Try to read existing prevClose from Firebase first (so restarts don't reset)
+  const snap = await pricesRef.child(symbol).once('value');
+  const existing = snap.val() || {};
+  if (existing.prevClose && existing.prevCloseDate === today) {
+    cryptoPrevClose[symbol] = { price: existing.prevClose, date: today };
+    console.log(`[crypto-seed] ${symbol} loaded existing prevClose=${existing.prevClose}`);
+    return;
+  }
+
+  // First time today — anchor today's prevClose to current price
+  cryptoPrevClose[symbol] = { price: currentPrice, date: today };
   await pricesRef.child(symbol).update({
     prevClose: currentPrice,
     prevCloseDate: today,
   });
-}
-
-function recomputeCryptoPercent(symbol, price) {
-  pricesRef.child(symbol).once('value').then(snap => {
-    const v = snap.val() || {};
-    if (v.prevClose && v.prevClose > 0) {
-      const pct = ((price - v.prevClose) / v.prevClose) * 100;
-      pricesRef.child(symbol).update({ percent: pct });
-    }
-  });
+  console.log(`[crypto-seed] ${symbol} new prevClose=${currentPrice}`);
 }
 
 // ---------- WebSocket ----------
@@ -116,16 +117,43 @@ function connectWebSocket() {
   ws.on('message', (data) => {
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
-    if (msg.type === 'trade' && msg.data) {
-      const latest = {};
-      msg.data.forEach(t => { latest[t.s] = t; });
-      Object.values(latest).forEach(t => {
-        pricesRef.child(t.s).update({ price: t.p, updatedAt: Date.now() });
-        if (isCrypto(t.s)) {
-          ensureCryptoPrevClose(t.s, t.p).then(() => recomputeCryptoPercent(t.s, t.p));
+    if (msg.type !== 'trade' || !msg.data) return;
+
+    // Pick most recent trade per symbol within this batch
+    const latest = {};
+    msg.data.forEach(t => {
+      if (!latest[t.s] || t.t > latest[t.s].t) latest[t.s] = t;
+    });
+
+    Object.values(latest).forEach(t => {
+      const sym = t.s;
+      const price = t.p;
+
+      // Build the update for this tick
+      const update = { price, updatedAt: Date.now() };
+
+      // Crypto: compute percent in memory and include in this single write
+      if (isCrypto(sym)) {
+        const cached = cryptoPrevClose[sym];
+        if (cached && cached.price > 0) {
+          const pct = ((price - cached.price) / cached.price) * 100;
+          // Throttle percent writes to once every 2s per symbol so we don't
+          // spam Firebase / re-render the UI on every tick
+          const now = Date.now();
+          if (!lastPercentWrite[sym] || now - lastPercentWrite[sym] > 2000) {
+            update.percent = pct;
+            lastPercentWrite[sym] = now;
+          }
+        } else {
+          // Not seeded yet — fire-and-forget seed; next tick will compute
+          seedCryptoPrevClose(sym, price).catch(() => {});
         }
+      }
+
+      pricesRef.child(sym).update(update).catch(err => {
+        console.warn(`[ws-write] ${sym} failed:`, err.message);
       });
-    }
+    });
   });
 
   ws.on('error', (err) => console.warn('WS error:', err.message));
@@ -172,6 +200,8 @@ watchlistRef.on('child_removed', (snap) => {
     ws.send(JSON.stringify({ type: 'unsubscribe', symbol }));
     subscribed.delete(symbol);
   }
+  delete cryptoPrevClose[symbol];
+  delete lastPercentWrite[symbol];
   pricesRef.child(symbol).remove();
 });
 
