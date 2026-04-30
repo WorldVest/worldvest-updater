@@ -1,12 +1,11 @@
 {
   "name": "worldvest-updater",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "firebase-admin": "^12.0.0",
-    "ws": "^8.18.0"
+    "firebase-admin": "^12.0.0"
   }
 }
