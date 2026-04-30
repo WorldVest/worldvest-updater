@@ -2,21 +2,24 @@
  * WorldVest price updater.
  *
  * Polls every POLL_INTERVAL_MS:
- *   - Stocks (e.g. "AAPL"): Finnhub /quote — one call per ticker, throttled
- *   - Crypto (e.g. "CG:bitcoin" or "BINANCE:BTCUSDT"): Binance /api/v3/ticker/24hr
- *     — one batched call for all coins at once, no key required
+ *   - Stocks: Finnhub /quote (one call per ticker, throttled)
+ *   - Crypto: CoinGecko /coins/markets (one batched call for all coins)
  *
- * Writes results to /prices/{SYMBOL} in Firebase.
+ * Writes to /prices/{SYMBOL} in Firebase.
  *
- * Coins not listed on Binance (e.g. HYPE/Hyperliquid) will show "—" in the UI.
+ * Env vars on Render:
+ *   FIREBASE_SERVICE_ACCOUNT  (required)
+ *   FINNHUB_KEY               (optional, has fallback)
+ *   COINGECKO_KEY             (recommended — free Demo key, 30 calls/min)
  */
 
 import admin from 'firebase-admin';
 import http from 'http';
 
 const FINNHUB_KEY = process.env.FINNHUB_KEY || "d7ok9vhr01qsb7bf9bdgd7ok9vhr01qsb7bf9be0";
-const POLL_INTERVAL_MS = 15 * 1000;
-const STOCK_RATE_LIMIT_MS = 1100; // Finnhub free tier: 60/min
+const COINGECKO_KEY = process.env.COINGECKO_KEY || "";
+const POLL_INTERVAL_MS = 30 * 1000;     // 30s — comfortable inside 30/min limit
+const STOCK_RATE_LIMIT_MS = 1100;       // Finnhub free: 60/min
 
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
@@ -27,7 +30,7 @@ const db = admin.database();
 const watchlistRef = db.ref('watchlist');
 const pricesRef = db.ref('prices');
 
-// ---------- HTTP keepalive (Render Web Service requirement) ----------
+// ---------- HTTP keepalive ----------
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('WorldVest Price Updater is running.');
@@ -37,43 +40,26 @@ http.createServer((req, res) => {
 
 // ---------- Symbol classification ----------
 //   "AAPL"             → stock
-//   "CG:bitcoin"       → crypto, base "BTC" → Binance "BTCUSDT"
-//   "BINANCE:BTCUSDT"  → legacy crypto, already in Binance format
-//
-// CoinGecko ID → Binance base symbol mapping. CoinGecko IDs are slugs
-// (e.g. "bitcoin", "ethereum"); Binance uses ticker symbols (BTC, ETH).
-const CG_ID_TO_BINANCE_BASE = {
-  bitcoin: 'BTC',         ethereum: 'ETH',          solana: 'SOL',
-  ripple: 'XRP',          binancecoin: 'BNB',       cardano: 'ADA',
-  dogecoin: 'DOGE',       'avalanche-2': 'AVAX',    chainlink: 'LINK',
-  polkadot: 'DOT',        'matic-network': 'MATIC', litecoin: 'LTC',
-  tron: 'TRX',            'bitcoin-cash': 'BCH',    cosmos: 'ATOM',
-  near: 'NEAR',           uniswap: 'UNI',           stellar: 'XLM',
-  aptos: 'APT',           arbitrum: 'ARB',          optimism: 'OP',
-  'injective-protocol': 'INJ', filecoin: 'FIL',     sui: 'SUI',
-  'ethereum-classic': 'ETC', zcash: 'ZEC',          monero: 'XMR',
-  shiba: 'SHIB',          'shiba-inu': 'SHIB',      pepe: 'PEPE',
-  toncoin: 'TON',         'the-open-network': 'TON', vechain: 'VET',
-  algorand: 'ALGO',       hedera: 'HBAR',           render: 'RENDER',
-  'render-token': 'RENDER', fantom: 'FTM',          sonic: 'S',
-  internet: 'ICP',        'internet-computer': 'ICP',
-  fetch: 'FET',           'fetch-ai': 'FET',        ondo: 'ONDO',
-  jupiter: 'JUP',         'jupiter-exchange-solana': 'JUP',
-  bonk: 'BONK',           celestia: 'TIA',          worldcoin: 'WLD',
-  'worldcoin-wld': 'WLD', sei: 'SEI',               'sei-network': 'SEI',
-  'kaspa': 'KAS',         'official-trump': 'TRUMP', 'pi-network': 'PI',
+//   "CG:bitcoin"       → crypto, CoinGecko id "bitcoin"
+//   "BINANCE:BTCUSDT"  → legacy crypto, derive id from base symbol
+const LEGACY_BASE_TO_CG = {
+  btc:'bitcoin', eth:'ethereum', sol:'solana', xrp:'ripple', bnb:'binancecoin',
+  ada:'cardano', doge:'dogecoin', avax:'avalanche-2', link:'chainlink',
+  dot:'polkadot', matic:'matic-network', ltc:'litecoin', trx:'tron',
+  bch:'bitcoin-cash', atom:'cosmos', near:'near', uni:'uniswap',
+  xlm:'stellar', apt:'aptos', arb:'arbitrum', op:'optimism',
+  inj:'injective-protocol', fil:'filecoin', sui:'sui', etc:'ethereum-classic',
+  zec:'zcash',
 };
 
-// Binance symbol → quote currency. Try USDT first (most liquid).
 function classify(symbol) {
   if (symbol.startsWith('CG:')) {
-    const cgId = symbol.slice(3).toLowerCase();
-    const base = CG_ID_TO_BINANCE_BASE[cgId] || cgId.toUpperCase().replace(/[^A-Z0-9]/g, '');
-    return { kind: 'crypto', binanceSymbol: base + 'USDT' };
+    return { kind: 'crypto', cgId: symbol.slice(3) };
   }
   if (symbol.includes(':')) {
-    // Legacy "BINANCE:BTCUSDT" format
-    return { kind: 'crypto', binanceSymbol: symbol.split(':')[1] };
+    const pair = symbol.split(':')[1] || '';
+    const base = pair.replace(/USDT$|USD$|USDC$|BUSD$/i, '').toLowerCase();
+    return { kind: 'crypto', cgId: LEGACY_BASE_TO_CG[base] || null };
   }
   return { kind: 'stock' };
 }
@@ -101,69 +87,48 @@ async function fetchStock(symbol) {
   }
 }
 
-// ---------- Binance /api/v3/ticker/24hr (crypto, batched) ----------
-async function fetchCryptoBatch(binanceSymbols) {
-  if (binanceSymbols.length === 0) return {};
+// ---------- CoinGecko /coins/markets (crypto, batched) ----------
+async function fetchCryptoBatch(cgIds) {
+  if (cgIds.length === 0) return {};
+  const ids = [...new Set(cgIds)].join(',');
+  const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${encodeURIComponent(ids)}&price_change_percentage=24h`;
+  const headers = { 'Accept': 'application/json' };
+  if (COINGECKO_KEY) headers['x-cg-demo-api-key'] = COINGECKO_KEY;
 
-  // Binance accepts symbols as a JSON-encoded array in the query string.
-  const symbolsParam = JSON.stringify([...new Set(binanceSymbols)]);
-  const url = `https://api.binance.com/api/v3/ticker/24hr?symbols=${encodeURIComponent(symbolsParam)}`;
-
-  try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      // Binance returns 400 if any symbol in the batch is invalid.
-      // Fall back to per-symbol fetching so one bad coin doesn't kill all.
-      if (res.status === 400) {
-        console.warn('[crypto] batch had invalid symbols, falling back to per-symbol');
-        return await fetchCryptoOneByOne(binanceSymbols);
-      }
-      console.warn(`[crypto] batch HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      return {};
-    }
-    const data = await res.json();
-    if (!Array.isArray(data)) {
-      console.warn('[crypto] response not an array:', JSON.stringify(data).slice(0, 200));
-      return {};
-    }
-    const out = {};
-    for (const t of data) {
-      out[t.symbol] = {
-        price: Number(t.lastPrice ?? 0),
-        percent: Number(t.priceChangePercent ?? 0),
-      };
-    }
-    console.log(`[crypto] got ${Object.keys(out).length} tickers from Binance`);
-    return out;
-  } catch (e) {
-    console.warn('[crypto] batch failed:', e.message);
-    return {};
-  }
-}
-
-// Fallback when batch fails due to one invalid symbol — fetch each separately,
-// skipping any that 400. Keeps the rest of the watchlist working.
-async function fetchCryptoOneByOne(binanceSymbols) {
-  const out = {};
-  for (const sym of binanceSymbols) {
+  // Retry up to 3x with exponential backoff on rate-limit errors
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(
-        `https://api.binance.com/api/v3/ticker/24hr?symbol=${encodeURIComponent(sym)}`
-      );
-      if (!res.ok) {
-        console.warn(`[crypto] ${sym} not on Binance (HTTP ${res.status})`);
+      const res = await fetch(url, { headers });
+      if (res.status === 429) {
+        const wait = attempt * 2000;
+        console.warn(`[crypto] 429 rate-limited (attempt ${attempt}/3), waiting ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
         continue;
       }
-      const t = await res.json();
-      out[sym] = {
-        price: Number(t.lastPrice ?? 0),
-        percent: Number(t.priceChangePercent ?? 0),
-      };
+      if (!res.ok) {
+        console.warn(`[crypto] HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+        return {};
+      }
+      const data = await res.json();
+      if (!Array.isArray(data)) {
+        console.warn('[crypto] response not an array:', JSON.stringify(data).slice(0, 200));
+        return {};
+      }
+      const out = {};
+      for (const coin of data) {
+        out[coin.id] = {
+          price: Number(coin.current_price ?? 0),
+          percent: Number(coin.price_change_percentage_24h ?? 0),
+        };
+      }
+      console.log(`[crypto] got ${data.length} coins from CoinGecko`);
+      return out;
     } catch (e) {
-      console.warn(`[crypto] ${sym} failed:`, e.message);
+      console.warn(`[crypto] attempt ${attempt} failed:`, e.message);
+      if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 2000));
     }
   }
-  return out;
+  return {};
 }
 
 // ---------- One poll cycle ----------
@@ -183,23 +148,30 @@ async function pollCycle() {
   }
 
   const stocks = [];
-  const cryptoSymToBinance = {}; // watchlist symbol → Binance symbol
+  const cryptoIds = [];
+  const cryptoSymToId = {};
   for (const sym of symbols) {
     const c = classify(sym);
-    if (c.kind === 'stock') stocks.push(sym);
-    else if (c.kind === 'crypto' && c.binanceSymbol) cryptoSymToBinance[sym] = c.binanceSymbol;
+    if (c.kind === 'stock') {
+      stocks.push(sym);
+    } else if (c.kind === 'crypto' && c.cgId) {
+      cryptoIds.push(c.cgId);
+      cryptoSymToId[sym] = c.cgId;
+    }
   }
 
-  console.log(`[cycle] ${stocks.length} stocks, ${Object.keys(cryptoSymToBinance).length} crypto`);
+  console.log(`[cycle] ${stocks.length} stocks, ${cryptoIds.length} crypto`);
 
-  // ----- Crypto: one batched Binance call -----
-  const cryptoSyms = Object.values(cryptoSymToBinance);
-  if (cryptoSyms.length > 0) {
-    const data = await fetchCryptoBatch(cryptoSyms);
+  // Crypto: one batched call
+  if (cryptoIds.length > 0) {
+    const data = await fetchCryptoBatch(cryptoIds);
     let written = 0;
-    for (const [sym, binSym] of Object.entries(cryptoSymToBinance)) {
-      const d = data[binSym];
-      if (!d) continue;
+    for (const [sym, cgId] of Object.entries(cryptoSymToId)) {
+      const d = data[cgId];
+      if (!d) {
+        console.warn(`[crypto] no data for ${sym} (cgId=${cgId})`);
+        continue;
+      }
       try {
         await pricesRef.child(sym).update({
           price: d.price,
@@ -211,10 +183,10 @@ async function pollCycle() {
         console.warn(`[crypto] write ${sym} failed:`, e.message);
       }
     }
-    console.log(`[crypto] wrote ${written}/${cryptoSyms.length} prices`);
+    console.log(`[crypto] wrote ${written}/${Object.keys(cryptoSymToId).length} prices`);
   }
 
-  // ----- Stocks: one call each, throttled -----
+  // Stocks: one call each, throttled
   for (const sym of stocks) {
     const q = await fetchStock(sym);
     if (q) {
@@ -233,7 +205,7 @@ async function pollCycle() {
   }
 }
 
-// ---------- Cleanup when a ticker is removed ----------
+// ---------- Cleanup ----------
 watchlistRef.on('child_removed', (snap) => {
   pricesRef.child(snap.key).remove().catch(() => {});
 });
@@ -250,6 +222,8 @@ async function loop() {
   }
 }
 
-console.log('🚀 WorldVest Updater Running (Finnhub stocks + Binance crypto)');
-console.log(`   FINNHUB_KEY: ${FINNHUB_KEY ? '✓ set' : '✗ MISSING'}`);
+console.log('🚀 WorldVest Updater Running (Finnhub stocks + CoinGecko crypto)');
+console.log(`   FINNHUB_KEY:   ${FINNHUB_KEY ? '✓ set' : '✗ MISSING'}`);
+console.log(`   COINGECKO_KEY: ${COINGECKO_KEY ? '✓ set (Demo, 30/min)' : '⚠ unset (using public 5-15/min)'}`);
+console.log(`   POLL_INTERVAL: ${POLL_INTERVAL_MS / 1000}s`);
 loop();
