@@ -2,15 +2,15 @@
  * WorldVest price updater.
  *
  * Polls every POLL_INTERVAL_MS:
- *   - Stocks: Finnhub /quote (one call per ticker, throttled)
- *   - Crypto: CoinGecko /coins/markets (one batched call for all coins)
+ *   - Stocks: Finnhub /quote
+ *   - Crypto: CoinGecko /coins/markets (batched)
  *
- * Writes to /prices/{SYMBOL} in Firebase.
- *
- * Env vars on Render:
- *   FIREBASE_SERVICE_ACCOUNT  (required)
- *   FINNHUB_KEY               (optional, has fallback)
- *   COINGECKO_KEY             (recommended — free Demo key, 30 calls/min)
+ * Hardening:
+ *   - All fetches have explicit timeouts (no infinite hangs)
+ *   - Each cycle has an overall timeout (force-aborts a stuck cycle)
+ *   - Watchdog detects if no cycle has completed recently and exits the
+ *     process so Render restarts it
+ *   - Process-level error handlers log everything that crashes
  */
 
 import admin from 'firebase-admin';
@@ -18,8 +18,12 @@ import http from 'http';
 
 const FINNHUB_KEY = process.env.FINNHUB_KEY || "d7ok9vhr01qsb7bf9bdgd7ok9vhr01qsb7bf9be0";
 const COINGECKO_KEY = process.env.COINGECKO_KEY || "";
-const POLL_INTERVAL_MS = 30 * 1000;     // 30s — comfortable inside 30/min limit
-const STOCK_RATE_LIMIT_MS = 1100;       // Finnhub free: 60/min
+const POLL_INTERVAL_MS = 30 * 1000;
+const STOCK_RATE_LIMIT_MS = 1100;
+const FETCH_TIMEOUT_MS = 12 * 1000;        // any single HTTP call
+const CYCLE_TIMEOUT_MS = 5 * 60 * 1000;    // an entire cycle (max ~50 stocks worst-case)
+const WATCHDOG_INTERVAL_MS = 60 * 1000;    // check every minute
+const WATCHDOG_DEADLINE_MS = 10 * 60 * 1000; // if no cycle finished in 10 min, exit
 
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
@@ -30,18 +34,46 @@ const db = admin.database();
 const watchlistRef = db.ref('watchlist');
 const pricesRef = db.ref('prices');
 
-// ---------- HTTP keepalive ----------
+let lastCycleCompletedAt = Date.now();
+let cycleCount = 0;
+
+// ---------- Process-level error visibility ----------
+process.on('uncaughtException', (err) => {
+  console.error('💥 uncaughtException:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('💥 unhandledRejection:', reason);
+});
+
+// ---------- HTTP keepalive + status endpoint ----------
 http.createServer((req, res) => {
+  if (req.url === '/status' || req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      ok: true,
+      cycleCount,
+      lastCycleAgoSec: Math.floor((Date.now() - lastCycleCompletedAt) / 1000),
+    }));
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('WorldVest Price Updater is running.');
 }).listen(process.env.PORT || 3000, () => {
   console.log(`HTTP server listening on port ${process.env.PORT || 3000}`);
 });
 
+// ---------- fetchWithTimeout: no more infinite hangs ----------
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 // ---------- Symbol classification ----------
-//   "AAPL"             → stock
-//   "CG:bitcoin"       → crypto, CoinGecko id "bitcoin"
-//   "BINANCE:BTCUSDT"  → legacy crypto, derive id from base symbol
 const LEGACY_BASE_TO_CG = {
   btc:'bitcoin', eth:'ethereum', sol:'solana', xrp:'ripple', bnb:'binancecoin',
   ada:'cardano', doge:'dogecoin', avax:'avalanche-2', link:'chainlink',
@@ -64,10 +96,10 @@ function classify(symbol) {
   return { kind: 'stock' };
 }
 
-// ---------- Finnhub /quote (stocks) ----------
+// ---------- Finnhub /quote ----------
 async function fetchStock(symbol) {
   try {
-    const res = await fetch(
+    const res = await fetchWithTimeout(
       `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}&token=${FINNHUB_KEY}`
     );
     if (!res.ok) {
@@ -82,12 +114,12 @@ async function fetchStock(symbol) {
       prevClose: Number(q.pc ?? 0),
     };
   } catch (e) {
-    console.warn(`[stock] ${symbol} failed:`, e.message);
+    console.warn(`[stock] ${symbol} failed:`, e.name === 'AbortError' ? 'timeout' : e.message);
     return null;
   }
 }
 
-// ---------- CoinGecko /coins/markets (crypto, batched) ----------
+// ---------- CoinGecko /coins/markets ----------
 async function fetchCryptoBatch(cgIds) {
   if (cgIds.length === 0) return {};
   const ids = [...new Set(cgIds)].join(',');
@@ -95,25 +127,21 @@ async function fetchCryptoBatch(cgIds) {
   const headers = { 'Accept': 'application/json' };
   if (COINGECKO_KEY) headers['x-cg-demo-api-key'] = COINGECKO_KEY;
 
-  // Retry up to 3x with exponential backoff on rate-limit errors
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await fetch(url, { headers });
+      const res = await fetchWithTimeout(url, { headers });
       if (res.status === 429) {
         const wait = attempt * 2000;
-        console.warn(`[crypto] 429 rate-limited (attempt ${attempt}/3), waiting ${wait}ms`);
+        console.warn(`[crypto] 429 (attempt ${attempt}/3), waiting ${wait}ms`);
         await new Promise(r => setTimeout(r, wait));
         continue;
       }
       if (!res.ok) {
-        console.warn(`[crypto] HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+        console.warn(`[crypto] HTTP ${res.status}`);
         return {};
       }
       const data = await res.json();
-      if (!Array.isArray(data)) {
-        console.warn('[crypto] response not an array:', JSON.stringify(data).slice(0, 200));
-        return {};
-      }
+      if (!Array.isArray(data)) return {};
       const out = {};
       for (const coin of data) {
         out[coin.id] = {
@@ -121,10 +149,11 @@ async function fetchCryptoBatch(cgIds) {
           percent: Number(coin.price_change_percentage_24h ?? 0),
         };
       }
-      console.log(`[crypto] got ${data.length} coins from CoinGecko`);
+      console.log(`[crypto] got ${data.length} coins`);
       return out;
     } catch (e) {
-      console.warn(`[crypto] attempt ${attempt} failed:`, e.message);
+      const msg = e.name === 'AbortError' ? 'timeout' : e.message;
+      console.warn(`[crypto] attempt ${attempt} failed: ${msg}`);
       if (attempt < 3) await new Promise(r => setTimeout(r, attempt * 2000));
     }
   }
@@ -132,7 +161,7 @@ async function fetchCryptoBatch(cgIds) {
 }
 
 // ---------- One poll cycle ----------
-async function pollCycle() {
+async function pollCycleInner() {
   let symbols;
   try {
     const snap = await watchlistRef.once('value');
@@ -152,50 +181,42 @@ async function pollCycle() {
   const cryptoSymToId = {};
   for (const sym of symbols) {
     const c = classify(sym);
-    if (c.kind === 'stock') {
-      stocks.push(sym);
-    } else if (c.kind === 'crypto' && c.cgId) {
+    if (c.kind === 'stock') stocks.push(sym);
+    else if (c.kind === 'crypto' && c.cgId) {
       cryptoIds.push(c.cgId);
       cryptoSymToId[sym] = c.cgId;
     }
   }
 
-  console.log(`[cycle] ${stocks.length} stocks, ${cryptoIds.length} crypto`);
+  console.log(`[cycle #${cycleCount + 1}] ${stocks.length} stocks, ${cryptoIds.length} crypto`);
 
-  // Crypto: one batched call
+  // Crypto: batched
   if (cryptoIds.length > 0) {
     const data = await fetchCryptoBatch(cryptoIds);
     let written = 0;
     for (const [sym, cgId] of Object.entries(cryptoSymToId)) {
       const d = data[cgId];
-      if (!d) {
-        console.warn(`[crypto] no data for ${sym} (cgId=${cgId})`);
-        continue;
-      }
+      if (!d) continue;
       try {
         await pricesRef.child(sym).update({
-          price: d.price,
-          percent: d.percent,
-          updatedAt: Date.now(),
+          price: d.price, percent: d.percent, updatedAt: Date.now(),
         });
         written++;
       } catch (e) {
         console.warn(`[crypto] write ${sym} failed:`, e.message);
       }
     }
-    console.log(`[crypto] wrote ${written}/${Object.keys(cryptoSymToId).length} prices`);
+    if (written > 0) console.log(`[crypto] wrote ${written}/${Object.keys(cryptoSymToId).length}`);
   }
 
-  // Stocks: one call each, throttled
+  // Stocks: per-symbol with throttle
   for (const sym of stocks) {
     const q = await fetchStock(sym);
     if (q) {
       try {
         await pricesRef.child(sym).update({
-          price: q.price,
-          percent: q.percent,
-          prevClose: q.prevClose,
-          updatedAt: Date.now(),
+          price: q.price, percent: q.percent,
+          prevClose: q.prevClose, updatedAt: Date.now(),
         });
       } catch (e) {
         console.warn(`[stock] write ${sym} failed:`, e.message);
@@ -205,18 +226,42 @@ async function pollCycle() {
   }
 }
 
-// ---------- Cleanup ----------
+// Wrap the inner cycle in an overall timeout so a stuck cycle can't hang forever
+async function pollCycle() {
+  await Promise.race([
+    pollCycleInner(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('cycle timeout')), CYCLE_TIMEOUT_MS)
+    ),
+  ]);
+}
+
+// ---------- Cleanup on ticker removal ----------
 watchlistRef.on('child_removed', (snap) => {
   pricesRef.child(snap.key).remove().catch(() => {});
 });
+
+// ---------- Watchdog: if no cycle has completed in 10 min, exit so Render restarts us ----------
+setInterval(() => {
+  const ageMs = Date.now() - lastCycleCompletedAt;
+  if (ageMs > WATCHDOG_DEADLINE_MS) {
+    console.error(`💀 watchdog: no cycle completed in ${Math.floor(ageMs / 1000)}s — exiting for restart`);
+    process.exit(1);
+  } else {
+    console.log(`[watchdog] last cycle ${Math.floor(ageMs / 1000)}s ago, total cycles: ${cycleCount}`);
+  }
+}, WATCHDOG_INTERVAL_MS);
 
 // ---------- Main loop ----------
 async function loop() {
   while (true) {
     try {
       await pollCycle();
+      lastCycleCompletedAt = Date.now();
+      cycleCount++;
     } catch (e) {
-      console.error('[loop] cycle error:', e.message);
+      console.error('[loop] cycle failed:', e.message);
+      // Don't update lastCycleCompletedAt — let the watchdog kill us if this keeps happening
     }
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
   }
@@ -224,6 +269,7 @@ async function loop() {
 
 console.log('🚀 WorldVest Updater Running (Finnhub stocks + CoinGecko crypto)');
 console.log(`   FINNHUB_KEY:   ${FINNHUB_KEY ? '✓ set' : '✗ MISSING'}`);
-console.log(`   COINGECKO_KEY: ${COINGECKO_KEY ? '✓ set (Demo, 30/min)' : '⚠ unset (using public 5-15/min)'}`);
+console.log(`   COINGECKO_KEY: ${COINGECKO_KEY ? '✓ set (Demo, 30/min)' : '⚠ unset'}`);
 console.log(`   POLL_INTERVAL: ${POLL_INTERVAL_MS / 1000}s`);
+console.log(`   FETCH_TIMEOUT: ${FETCH_TIMEOUT_MS / 1000}s per call`);
 loop();
