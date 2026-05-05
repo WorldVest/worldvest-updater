@@ -364,17 +364,39 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: "message (string) is required" }));
         return;
       }
-      // Cap history length defensively (client also caps, but trust nothing)
       const safeHistory = Array.isArray(history) ? history.slice(-40) : [];
-
       agentCallCount++;
-      const result = await handleAgentTurn(safeHistory, message.slice(0, 4000));
+
+      // Up to 3 attempts. Gemini occasionally returns 503 ("high demand") on
+      // free tier — retry with exponential backoff before giving up.
+      let lastErr = null;
+      let result = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          result = await handleAgentTurn(safeHistory, message.slice(0, 4000));
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          const msg = String(e.message || '');
+          const isOverloaded = /503|high demand|unavailable|UNAVAILABLE/i.test(msg);
+          if (!isOverloaded || attempt === 3) break;
+          const waitMs = attempt * 4000; // 4s, 8s
+          console.warn(`[agent] 503 attempt ${attempt}/3, retrying in ${waitMs}ms`);
+          await new Promise(r => setTimeout(r, waitMs));
+        }
+      }
+
+      if (lastErr) throw lastErr;
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ text: result.text, tools: result.tools }));
     } catch (e) {
       console.error('[agent] error:', e);
-      const status = /quota|rate|429/i.test(e.message) ? 429 : 500;
+      const msg = String(e.message || '');
+      let status = 500;
+      if (/quota|rate|429/i.test(msg)) status = 429;
+      else if (/503|high demand|unavailable|UNAVAILABLE/i.test(msg)) status = 503;
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: e.message || 'Agent error' }));
     }
