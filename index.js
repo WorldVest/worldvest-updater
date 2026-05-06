@@ -33,10 +33,16 @@ const CYCLE_TIMEOUT_MS = 5 * 60 * 1000;
 const WATCHDOG_INTERVAL_MS = 60 * 1000;
 const WATCHDOG_DEADLINE_MS = 10 * 60 * 1000;
 
-// Historical sampling: one data point per HISTORY_INTERVAL_MS, keep
-// HISTORY_MAX_POINTS total. 30 min × 336 = 7 days of data.
-const HISTORY_INTERVAL_MS = 30 * 60 * 1000;
-const HISTORY_MAX_POINTS = 336;
+// Historical sampling.
+//
+//   Crypto:  one point every 30 min, 24/7  (~336 points = 7 days)
+//   Stocks:  one point every 10 min, only during US market hours
+//            9:30am – 4:00pm ET, Mon–Fri  (~39/day × 5 = 195 points/week)
+//
+// The cap is the larger of the two so neither type ever truncates within 7 days.
+const HISTORY_INTERVAL_CRYPTO_MS = 30 * 60 * 1000;
+const HISTORY_INTERVAL_STOCK_MS = 10 * 60 * 1000;
+const HISTORY_MAX_POINTS = 400;
 
 // ---------- Firebase ----------
 admin.initializeApp({
@@ -91,24 +97,54 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS)
 }
 
 // ---------- Historical price tracking (for sparklines) ----------
-// Saves one price point per symbol every HISTORY_INTERVAL_MS, trimming the
-// oldest entries so we keep at most HISTORY_MAX_POINTS (= 7 days at 30min).
-async function recordHistorySample(symbol, price) {
+
+// Are US stock markets open right now? Mon–Fri, 9:30am–4:00pm ET.
+// We don't track holidays — they'll just produce flat segments which is fine.
+// Uses Intl.DateTimeFormat for proper DST handling (don't hardcode UTC offset).
+function isUsMarketOpen(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false,
+  }).formatToParts(now);
+
+  const get = type => parts.find(p => p.type === type)?.value;
+  const weekday = get('weekday'); // "Mon", "Tue", ...
+  if (weekday === 'Sat' || weekday === 'Sun') return false;
+
+  const hour = parseInt(get('hour'), 10);
+  const minute = parseInt(get('minute'), 10);
+  const minutesSinceMidnight = hour * 60 + minute;
+  const open = 9 * 60 + 30;  // 9:30 AM
+  const close = 16 * 60;     // 4:00 PM
+  return minutesSinceMidnight >= open && minutesSinceMidnight < close;
+}
+
+// Saves one price point per symbol, throttled by asset-type-specific
+// interval. Stocks also gated to market hours. Trims to HISTORY_MAX_POINTS.
+async function recordHistorySample(symbol, price, kind) {
   if (!Number.isFinite(price) || price <= 0) return;
+
+  // Stocks: only during market hours
+  if (kind === 'stock' && !isUsMarketOpen()) return;
+
+  const interval = kind === 'crypto' ? HISTORY_INTERVAL_CRYPTO_MS : HISTORY_INTERVAL_STOCK_MS;
   const now = Date.now();
   const last = lastHistorySampleAt[symbol] || 0;
-  if (now - last < HISTORY_INTERVAL_MS) return; // throttled
+  if (now - last < interval) return; // throttled
 
   try {
     await historicalRef.child(symbol).push({ t: now, p: price });
     lastHistorySampleAt[symbol] = now;
 
-    // Trim: only run trim every ~10 samples to avoid extra reads on every tick.
-    // We don't need to be exact — bouncing between 336 and 346 is fine.
+    // Trim only occasionally to keep Firebase reads down. Bouncing between
+    // 400 and ~410 points is fine.
     if (Math.random() < 0.1) {
       const snap = await historicalRef.child(symbol).once('value');
       const all = snap.val() || {};
-      const keys = Object.keys(all); // chronological by Firebase push key
+      const keys = Object.keys(all);
       if (keys.length > HISTORY_MAX_POINTS) {
         const excess = keys.length - HISTORY_MAX_POINTS;
         const updates = {};
@@ -256,7 +292,7 @@ async function pollCycleInner() {
           percent: d.percent,
           updatedAt: Date.now(),
         });
-        recordHistorySample(sym, d.price);
+        recordHistorySample(sym, d.price, 'crypto');
         written++;
       } catch (e) {
         console.warn(`[crypto] write ${sym} failed:`, e.message);
@@ -276,7 +312,7 @@ async function pollCycleInner() {
           prevClose: q.prevClose,
           updatedAt: Date.now(),
         });
-        recordHistorySample(sym, q.price);
+        recordHistorySample(sym, q.price, 'stock');
       } catch (e) {
         console.warn(`[stock] write ${sym} failed:`, e.message);
       }
