@@ -33,6 +33,11 @@ const CYCLE_TIMEOUT_MS = 5 * 60 * 1000;
 const WATCHDOG_INTERVAL_MS = 60 * 1000;
 const WATCHDOG_DEADLINE_MS = 10 * 60 * 1000;
 
+// Historical sampling: one data point per HISTORY_INTERVAL_MS, keep
+// HISTORY_MAX_POINTS total. 30 min × 336 = 7 days of data.
+const HISTORY_INTERVAL_MS = 30 * 60 * 1000;
+const HISTORY_MAX_POINTS = 336;
+
 // ---------- Firebase ----------
 admin.initializeApp({
   credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
@@ -41,6 +46,12 @@ admin.initializeApp({
 const db = admin.database();
 const watchlistRef = db.ref('watchlist');
 const pricesRef = db.ref('prices');
+const historicalRef = db.ref('historical');
+
+// In-memory: when did we last save a history point for each symbol?
+// (Persists across cycles within a single process; rebuilt on restart from
+// the most recent point in Firebase.)
+const lastHistorySampleAt = {};
 
 // ---------- State ----------
 let lastCycleCompletedAt = Date.now();
@@ -76,6 +87,38 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS)
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(id);
+  }
+}
+
+// ---------- Historical price tracking (for sparklines) ----------
+// Saves one price point per symbol every HISTORY_INTERVAL_MS, trimming the
+// oldest entries so we keep at most HISTORY_MAX_POINTS (= 7 days at 30min).
+async function recordHistorySample(symbol, price) {
+  if (!Number.isFinite(price) || price <= 0) return;
+  const now = Date.now();
+  const last = lastHistorySampleAt[symbol] || 0;
+  if (now - last < HISTORY_INTERVAL_MS) return; // throttled
+
+  try {
+    await historicalRef.child(symbol).push({ t: now, p: price });
+    lastHistorySampleAt[symbol] = now;
+
+    // Trim: only run trim every ~10 samples to avoid extra reads on every tick.
+    // We don't need to be exact — bouncing between 336 and 346 is fine.
+    if (Math.random() < 0.1) {
+      const snap = await historicalRef.child(symbol).once('value');
+      const all = snap.val() || {};
+      const keys = Object.keys(all); // chronological by Firebase push key
+      if (keys.length > HISTORY_MAX_POINTS) {
+        const excess = keys.length - HISTORY_MAX_POINTS;
+        const updates = {};
+        for (let i = 0; i < excess; i++) updates[keys[i]] = null;
+        await historicalRef.child(symbol).update(updates);
+        console.log(`[history] ${symbol} trimmed ${excess} old points`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[history] ${symbol} sample failed:`, e.message);
   }
 }
 
@@ -213,6 +256,7 @@ async function pollCycleInner() {
           percent: d.percent,
           updatedAt: Date.now(),
         });
+        recordHistorySample(sym, d.price);
         written++;
       } catch (e) {
         console.warn(`[crypto] write ${sym} failed:`, e.message);
@@ -232,6 +276,7 @@ async function pollCycleInner() {
           prevClose: q.prevClose,
           updatedAt: Date.now(),
         });
+        recordHistorySample(sym, q.price);
       } catch (e) {
         console.warn(`[stock] write ${sym} failed:`, e.message);
       }
@@ -253,6 +298,7 @@ async function pollCycle() {
 // ---------- Cleanup when a ticker is removed ----------
 watchlistRef.on('child_removed', (snap) => {
   pricesRef.child(snap.key).remove().catch(() => {});
+  historicalRef.child(snap.key).remove().catch(() => {});
 });
 
 // ---------- Watchdog: restart if no cycle in 10 min ----------
