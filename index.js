@@ -26,7 +26,8 @@ import http from 'http';
 const FINNHUB_KEY = process.env.FINNHUB_KEY || "d7ok9vhr01qsb7bf9bdgd7ok9vhr01qsb7bf9be0";
 const COINGECKO_KEY = process.env.COINGECKO_KEY || "";
 
-const POLL_INTERVAL_MS = 30 * 1000;
+const POLL_INTERVAL_MS = 30 * 1000;          // Stock cycle (Finnhub: 60/min limit)
+const CRYPTO_POLL_INTERVAL_MS = 5 * 60 * 1000; // Crypto cycle (CoinGecko: 30/min, 10K/mo)
 const STOCK_RATE_LIMIT_MS = 1100;          // Finnhub free: 60/min
 const FETCH_TIMEOUT_MS = 12 * 1000;
 const CYCLE_TIMEOUT_MS = 5 * 60 * 1000;
@@ -61,7 +62,8 @@ const lastHistorySampleAt = {};
 
 // ---------- State ----------
 let lastCycleCompletedAt = Date.now();
-let cycleCount = 0;
+let stockCycleCount = 0;
+let cryptoCycleCount = 0;
 
 // ---------- Process-wide error visibility ----------
 process.on('uncaughtException', (err) => console.error('💥 uncaughtException:', err));
@@ -73,7 +75,8 @@ http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       ok: true,
-      cycleCount,
+      stockCycleCount,
+      cryptoCycleCount,
       lastCycleAgoSec: Math.floor((Date.now() - lastCycleCompletedAt) / 1000),
       uptimeSec: Math.floor(process.uptime()),
     }, null, 2));
@@ -250,21 +253,17 @@ async function fetchCryptoBatch(cgIds) {
 }
 
 // ---------- One poll cycle ----------
-async function pollCycleInner() {
-  let symbols;
+// Read the watchlist symbols, bucketed by asset kind.
+// Returns { stocks: [sym, ...], cryptoIds: [cgId, ...], cryptoSymToId: {sym: cgId} }
+async function readWatchlistBuckets() {
+  let symbols = [];
   try {
     const snap = await watchlistRef.once('value');
     symbols = Object.keys(snap.val() || {});
   } catch (e) {
     console.warn('[cycle] watchlist read failed:', e.message);
-    return;
+    return { stocks: [], cryptoIds: [], cryptoSymToId: {} };
   }
-  if (symbols.length === 0) {
-    console.log('[cycle] watchlist empty');
-    return;
-  }
-
-  // Bucket by kind
   const stocks = [];
   const cryptoIds = [];
   const cryptoSymToId = {};
@@ -277,31 +276,15 @@ async function pollCycleInner() {
       cryptoSymToId[sym] = c.cgId;
     }
   }
-  console.log(`[cycle #${cycleCount + 1}] ${stocks.length} stocks, ${cryptoIds.length} crypto`);
+  return { stocks, cryptoIds, cryptoSymToId };
+}
 
-  // Crypto: one batched call
-  if (cryptoIds.length > 0) {
-    const data = await fetchCryptoBatch(cryptoIds);
-    let written = 0;
-    for (const [sym, cgId] of Object.entries(cryptoSymToId)) {
-      const d = data[cgId];
-      if (!d) continue;
-      try {
-        await pricesRef.child(sym).update({
-          price: d.price,
-          percent: d.percent,
-          updatedAt: Date.now(),
-        });
-        recordHistorySample(sym, d.price, 'crypto');
-        written++;
-      } catch (e) {
-        console.warn(`[crypto] write ${sym} failed:`, e.message);
-      }
-    }
-    if (written > 0) console.log(`[crypto] wrote ${written}/${Object.keys(cryptoSymToId).length}`);
-  }
+// ---------- Stock cycle (runs every POLL_INTERVAL_MS = 30s) ----------
+async function pollStocksInner() {
+  const { stocks } = await readWatchlistBuckets();
+  if (stocks.length === 0) return;
 
-  // Stocks: per-symbol, throttled
+  console.log(`[stock cycle #${stockCycleCount + 1}] ${stocks.length} stocks`);
   for (const sym of stocks) {
     const q = await fetchStock(sym);
     if (q) {
@@ -321,12 +304,46 @@ async function pollCycleInner() {
   }
 }
 
-// Wrap cycle in overall timeout so a stuck call can't hang the loop forever
-async function pollCycle() {
+// ---------- Crypto cycle (runs every CRYPTO_POLL_INTERVAL_MS = 5min) ----------
+async function pollCryptoInner() {
+  const { cryptoIds, cryptoSymToId } = await readWatchlistBuckets();
+  if (cryptoIds.length === 0) return;
+
+  console.log(`[crypto cycle #${cryptoCycleCount + 1}] ${cryptoIds.length} crypto`);
+  const data = await fetchCryptoBatch(cryptoIds);
+  let written = 0;
+  for (const [sym, cgId] of Object.entries(cryptoSymToId)) {
+    const d = data[cgId];
+    if (!d) continue;
+    try {
+      await pricesRef.child(sym).update({
+        price: d.price,
+        percent: d.percent,
+        updatedAt: Date.now(),
+      });
+      recordHistorySample(sym, d.price, 'crypto');
+      written++;
+    } catch (e) {
+      console.warn(`[crypto] write ${sym} failed:`, e.message);
+    }
+  }
+  if (written > 0) console.log(`[crypto] wrote ${written}/${Object.keys(cryptoSymToId).length}`);
+}
+
+// Wrap each cycle in an overall timeout so a stuck call can't hang the loop forever
+async function pollStocks() {
   await Promise.race([
-    pollCycleInner(),
+    pollStocksInner(),
     new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('cycle timeout')), CYCLE_TIMEOUT_MS)
+      setTimeout(() => reject(new Error('stock cycle timeout')), CYCLE_TIMEOUT_MS)
+    ),
+  ]);
+}
+async function pollCrypto() {
+  await Promise.race([
+    pollCryptoInner(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('crypto cycle timeout')), CYCLE_TIMEOUT_MS)
     ),
   ]);
 }
@@ -337,33 +354,50 @@ watchlistRef.on('child_removed', (snap) => {
   historicalRef.child(snap.key).remove().catch(() => {});
 });
 
-// ---------- Watchdog: restart if no cycle in 10 min ----------
+// ---------- Watchdog: restart if no STOCK cycle in 10 min ----------
+// We watchdog on the stock cycle because it's the more frequent one (30s).
+// Crypto cycles only every 5min so it's a worse health signal.
 setInterval(() => {
   const ageMs = Date.now() - lastCycleCompletedAt;
   if (ageMs > WATCHDOG_DEADLINE_MS) {
-    console.error(`💀 watchdog: no cycle completed in ${Math.floor(ageMs / 1000)}s — exiting for restart`);
+    console.error(`💀 watchdog: no stock cycle completed in ${Math.floor(ageMs / 1000)}s — exiting for restart`);
     process.exit(1);
   } else {
-    console.log(`[watchdog] last cycle ${Math.floor(ageMs / 1000)}s ago, total cycles: ${cycleCount}`);
+    console.log(`[watchdog] last stock cycle ${Math.floor(ageMs / 1000)}s ago, totals: stock=${stockCycleCount} crypto=${cryptoCycleCount}`);
   }
 }, WATCHDOG_INTERVAL_MS);
 
-// ---------- Main loop ----------
-async function loop() {
+// ---------- Main loops ----------
+// Two independent loops run concurrently: stocks every 30s, crypto every 5min.
+// They share the watchlist read inside their own cycle but don't block each other.
+async function stockLoop() {
   while (true) {
     try {
-      await pollCycle();
+      await pollStocks();
       lastCycleCompletedAt = Date.now();
-      cycleCount++;
+      stockCycleCount++;
     } catch (e) {
-      console.error('[loop] cycle failed:', e.message);
+      console.error('[stock loop] cycle failed:', e.message);
     }
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
   }
 }
+async function cryptoLoop() {
+  while (true) {
+    try {
+      await pollCrypto();
+      cryptoCycleCount++;
+    } catch (e) {
+      console.error('[crypto loop] cycle failed:', e.message);
+    }
+    await new Promise(r => setTimeout(r, CRYPTO_POLL_INTERVAL_MS));
+  }
+}
 
 console.log('🚀 WorldVest Updater Running');
-console.log(`   FINNHUB_KEY:   ${FINNHUB_KEY ? '✓ set' : '✗ MISSING'}`);
-console.log(`   COINGECKO_KEY: ${COINGECKO_KEY ? '✓ set (Demo, 30/min)' : '⚠ unset (using public 5–15/min)'}`);
-console.log(`   POLL_INTERVAL: ${POLL_INTERVAL_MS / 1000}s`);
-loop();
+console.log(`   FINNHUB_KEY:    ${FINNHUB_KEY ? '✓ set' : '✗ MISSING'}`);
+console.log(`   COINGECKO_KEY:  ${COINGECKO_KEY ? '✓ set (Demo, 30/min)' : '⚠ unset (using public 5–15/min)'}`);
+console.log(`   STOCK INTERVAL: ${POLL_INTERVAL_MS / 1000}s`);
+console.log(`   CRYPTO INTERVAL: ${CRYPTO_POLL_INTERVAL_MS / 1000}s`);
+stockLoop();
+cryptoLoop();
